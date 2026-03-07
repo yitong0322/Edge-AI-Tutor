@@ -1,0 +1,49 @@
+[Unit]
+Description=Local AI Tutor Service
+After=network.target ollama.service asr.service tts.service
+Wants=tts.service
+
+[Service]
+WorkingDirectory=/home/user/AITutor
+User=root
+Group=root
+
+
+TimeoutStartSec=300
+
+# --- 1. 硬件优先级与内存锁定 ---
+# 赋予最高 CPU 优先级，解决音频卡顿 (underrun)
+Nice=-20
+CPUSchedulingPolicy=rr
+CPUSchedulingPriority=50
+# 锁定内存，防止模型数据被挤入 Swap 导致 24s 延迟
+LimitMEMLOCK=infinity
+
+# --- 2. 自动化内存大扫除 (ExecStartPre) ---
+# 同步磁盘并强制清理系统缓存
+ExecStartPre=/usr/bin/sync
+ExecStartPre=/bin/bash -c 'echo 3 > /proc/sys/vm/drop_caches'
+# 重置 Swap：强制清空 SD 卡上的交换分区，确保模型驻留在 RAM
+ExecStartPre=/sbin/swapoff -a
+ExecStartPre=/sbin/swapon -a
+# 等待 Ollama 服务响应并预热模型
+ExecStartPre=/bin/bash -c 'until /usr/bin/curl -s http://localhost:11434/api/tags > /dev/null; do sleep 2; done'
+# 修改后的 ExecStartPre 预热命令
+# 只加载模型，不输入任何文字
+ExecStartPre=/usr/bin/curl -X POST http://localhost:11434/api/generate -d '{"model": "llama3.2-3b-q6:latest"}'
+
+# --- 3. 运行环境与启动命令 ---
+Environment="OLLAMA_KEEP_ALIVE=-1"
+Environment="PYTHONUNBUFFERED=1"
+# 屏蔽 ONNX Runtime 的 GPU 报错警告，保持日志干净
+Environment="ORT_LOGGING_LEVEL=3"
+
+ExecStart=/home/user/AITutor/bin/python3 /home/user/AITutor/main.py
+
+# 异常退出时自动重启
+Restart=always
+RestartSec=10
+
+
+[Install]
+WantedBy=multi-user.target

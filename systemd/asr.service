@@ -1,0 +1,18 @@
+[Unit]
+Description=AITutor ASR Service
+After=network.target
+
+[Service]
+User=user
+Group=user
+WorkingDirectory=/home/user/AITutor
+
+# 使用虚拟环境的 Python
+ExecStart=/home/user/AITutor/bin/python /home/user/AITutor/asr_server.py
+
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

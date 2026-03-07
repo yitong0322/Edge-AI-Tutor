@@ -1,0 +1,29 @@
+[Unit]
+Description=AITutor TTS Service (Piper)
+After=network.target
+
+[Service]
+User=user
+Group=user
+WorkingDirectory=/home/user/AITutor
+
+# 使用虚拟环境的 Python
+ExecStart=/home/user/AITutor/bin/python /home/user/AITutor/tts_server.py
+
+Restart=always
+RestartSec=5
+
+# 环境变量
+Environment=PYTHONUNBUFFERED=1
+Environment=ORT_LOGGING_LEVEL=3
+
+# 优先级设置（比 ASR 高，保证音频流畅）
+Nice=-15
+CPUSchedulingPolicy=rr
+CPUSchedulingPriority=60
+
+# 启动超时
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target
