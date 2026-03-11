@@ -8,7 +8,7 @@ A fully offline, voice-interactive AI tutoring system running entirely on a Rasp
 
 ## 📖 Overview
 
-This project implements a fully offline Edge AI Tutoring System on a Raspberry Pi 5. It supports natural voice interaction and context-aware question answering over user-uploaded learning materials, powered by four independently managed services running entirely on-device.
+This project implements a fully offline Edge AI Tutoring System on a Raspberry Pi 5. It supports natural voice interaction and context-aware question answering over user-uploaded learning materials, powered by five independently managed systemd services running entirely on-device.
 
 Developed as a Final Year Project (FYP) at Nanyang Technological University (NTU), School of Electrical & Electronic Engineering.
 
@@ -18,7 +18,7 @@ Developed as a Final Year Project (FYP) at Nanyang Technological University (NTU
 
 - 🎙️ **Voice-in / Voice-out** — Whisper-base (INT8) ASR + Piper TTS (lessac-low) for fully spoken interaction
 - 🤖 **On-device LLM** — Llama 3.2 3B Instruct (Q6\_K) via Ollama, entirely local
-- 📚 **RAG / Learning mode** — Place PDFs in `data/`, run `ingest_pdf.py`, and ask questions about them; relevant context retrieved via ChromaDB + fastembed ONNX
+- 📚 **RAG / Learning mode** — Place PDFs in `data/`, run `ingest_pdf.py`, and ask questions about them; relevant context retrieved via ChromaDB + fastembed ONNX, served by a dedicated `rag.service`
 - 💬 **Chat mode** — General-purpose multi-turn conversation with up to 6-turn history
 - ⚡ **Edge-optimised** — ~1.74 s TTFT in chat mode; ~10.94 s TTFT in RAG mode (~54× faster than the naive baseline)
 - 🔒 **Fully offline** — All inference runs on-device; no data leaves the hardware
@@ -30,14 +30,17 @@ Developed as a Final Year Project (FYP) at Nanyang Technological University (NTU
 
 ![System Architecture Diagram](docs/System%20Architecture%20Diagram.jpg)
 
-The system is composed of four independently managed services, all running on-device:
+The system is composed of five independently managed systemd services, all running on-device. Four are custom FastAPI services; Ollama runs as its own native systemd service.
 
 | Service | Role | Port | Process Priority |
 |---|---|---|---|
 | `asr.service` | Whisper-base INT8 ASR | 8000 | default |
 | `tts.service` | Piper lessac-low TTS | 8001 | Nice=−15, RT scheduling |
+| `rag.service` | ChromaDB + fastembed retrieval | 8002 | default |
 | `ollama.service` | LLM serving | 11434 | default |
 | `aitutor.service` | Main orchestration app | — | Nice=−20, RT scheduling, MEMLOCKED |
+
+> **Design note:** `rag.service` runs fastembed ONNX in a process isolated from Ollama. This eliminates heap contention that would otherwise evict the LLM's KV cache, and is the primary reason RAG TTFT improved from ~93 s to ~10.94 s.
 
 ### AI Stack
 
@@ -46,7 +49,7 @@ The system is composed of four independently managed services, all running on-de
 | ASR | whisper-base | INT8 quantised, cpu\_threads=3, beam\_size=5 |
 | LLM | llama3.2:3b-instruct-q6\_K | Served via Ollama; temperature=0.3, num\_ctx=2048 |
 | TTS | en\_US-lessac-low | Piper, 16 kHz output, length\_scale=0.85, pre-warmed on startup |
-| Embeddings | BAAI/bge-small-en-v1.5 | fastembed ONNX, runs in isolated process |
+| Embeddings | BAAI/bge-small-en-v1.5 | fastembed ONNX, runs in isolated `rag.service` process |
 | Vector DB | ChromaDB | Collection: `electronics_knowledge`, chunk\_size=300, overlap=30 |
 
 ---
@@ -64,15 +67,17 @@ edge-ai-tutor/
 ├── requirements.txt
 │
 ├── src/
-│   ├── main.py               # Main orchestration app
+│   ├── main.py               # Main orchestration app (aitutor.service)
 │   ├── asr_server.py         # ASR FastAPI service (port 8000)
 │   ├── tts_server.py         # TTS FastAPI service (port 8001)
+│   ├── rag_server.py         # RAG FastAPI service (port 8002)
 │   ├── ingest_pdf.py         # PDF ingestion → ChromaDB vector store
 │   └── WhisPlay.py           # WhisPlay HAT driver (LCD, RGB LED, button)
 │
 ├── systemd/
 │   ├── asr.service
 │   ├── tts.service
+│   ├── rag.service
 │   ├── ollama.service
 │   └── aitutor.service
 │
@@ -181,8 +186,8 @@ for svc in systemd/*.service; do
 done
 
 sudo systemctl daemon-reload
-sudo systemctl enable ollama asr tts aitutor
-sudo systemctl start ollama asr tts aitutor
+sudo systemctl enable ollama asr tts rag aitutor
+sudo systemctl start ollama asr tts rag aitutor
 ```
 
 #### 7. Manual Launch (without systemd)
@@ -190,6 +195,7 @@ sudo systemctl start ollama asr tts aitutor
 ```bash
 python3 src/asr_server.py &
 python3 src/tts_server.py &
+python3 src/rag_server.py &
 python3 src/main.py
 ```
 
@@ -199,15 +205,14 @@ python3 src/main.py
 
 Interact with the system entirely by voice via the WhisPlay HAT:
 
-- Press the button to begin speaking
-- Release to send your query
+- Long-press the button to begin speaking; release to send your query
 - The RGB LED indicates system state (listening / thinking / speaking)
 
 The system supports two interaction modes, toggled with a single button click:
 
 **Chat mode** maintains up to 6 turns of conversation history for coherent multi-turn dialogue.
 
-**RAG / Learning mode** is triggered automatically when your query semantically matches content in the vector store (threshold: 0.35). Each query is answered independently using only the retrieved document context — stateless by design, to prevent history contamination of retrieval-augmented responses.
+**RAG / Learning mode** is triggered automatically when your query semantically matches content in the vector store (threshold: 0.35). `main.py` sends a POST request to `rag.service` (:8002), which returns the top-1 retrieved chunk; the result is used to build an augmented prompt sent to Ollama. Each query is answered independently — stateless by design, to prevent history contamination of retrieval-augmented responses.
 
 ![Interaction Flowchart](docs/Flowchart.jpg)
 
@@ -231,7 +236,7 @@ The system supports two interaction modes, toggled with a single button click:
 | LLM temperature | 0.3 | `Modelfile.q6` |
 | LLM context window | 2048 tokens | `Modelfile.q6` |
 | RAG similarity threshold | 0.35 | `main.py` |
-| RAG top-k retrieval | 1 | `main.py` |
+| RAG top-k retrieval | 1 | `rag_server.py` |
 | Chat history turns | 6 | `main.py` |
 | Chunk size | 300 tokens | `ingest_pdf.py` |
 | Chunk overlap | 30 tokens | `ingest_pdf.py` |
@@ -249,7 +254,7 @@ The system supports two interaction modes, toggled with a single button click:
 
 > TTFT = Time to First Token. Measured on Raspberry Pi 5 (8 GB).
 
-**Key optimisation:** fastembed ONNX runs in a process isolated from Ollama, eliminating heap contention that would otherwise evict the LLM's KV cache. TTS and LLM inference run concurrently via non-blocking HTTP. The `aitutor.service` pre-clears OS page cache, resets swap, and pre-warms the model into RAM before the app starts.
+**Key optimisation:** `rag.service` runs fastembed ONNX in its own process, isolated from Ollama. This prevents heap contention that would otherwise evict the LLM's KV cache — the root cause of the ~93 s baseline latency. TTS and LLM inference run concurrently via non-blocking HTTP. The `aitutor.service` pre-clears the OS page cache, resets swap, and pre-warms the model into RAM before the app starts.
 
 ---
 
@@ -269,6 +274,7 @@ Process priorities across all services:
 | `aitutor.service` | −20 | rr, priority 50, MEMLOCKED |
 | `tts.service` | −15 | rr, priority 60 |
 | Piper subprocess | −10 | — |
+| `rag.service` | default | — |
 | `asr.service` | default | — |
 | `ollama.service` | default | — |
 
@@ -299,7 +305,7 @@ This project is licensed under the [MIT License](LICENSE).
 
 ## 📖 项目简介
 
-本项目在 Raspberry Pi 5 上实现了一套完全离线的边缘 AI 教学系统，支持自然语音交互，并可针对用户上传的学习材料进行上下文感知问答。系统由四个独立管理的 systemd 服务组成，全部在本地设备上运行。
+本项目在 Raspberry Pi 5 上实现了一套完全离线的边缘 AI 教学系统，支持自然语音交互，并可针对用户上传的学习材料进行上下文感知问答。系统由五个独立管理的 systemd 服务组成，全部在本地设备上运行——其中四个为自定义 FastAPI 服务，Ollama 作为原生 systemd 服务独立运行。
 
 本项目为南洋理工大学（NTU）电气与电子工程学院毕业设计（FYP）作品。
 
@@ -309,11 +315,27 @@ This project is licensed under the [MIT License](LICENSE).
 
 - 🎙️ **语音输入/输出** — Whisper-base（INT8）ASR + Piper TTS（lessac-low），实现全程语音交互
 - 🤖 **本地 LLM** — Llama 3.2 3B Instruct（Q6\_K）通过 Ollama 本地运行，无需联网
-- 📚 **RAG 学习模式** — 将 PDF 放入 `data/` 并运行 `ingest_pdf.py`，即可基于文档内容进行语义检索问答
+- 📚 **RAG 学习模式** — 将 PDF 放入 `data/` 并运行 `ingest_pdf.py`，由独立的 `rag.service`（端口 8002）提供语义检索服务
 - 💬 **对话模式** — 通用多轮对话，最多保留 6 轮历史上下文
 - ⚡ **边缘优化** — 对话模式首字时延约 1.74 秒，RAG 模式约 10.94 秒（较基线提升约 54 倍）
 - 🔒 **完全离线** — 所有推理在本地完成，数据不离开设备
 - 🖥️ **显示集成** — 在 WhisPlay HAT 的 240×280 LCD 上实时显示状态，RGB LED 指示系统状态
+
+---
+
+## 🏗️ 系统架构
+
+系统由五个独立 systemd 服务组成：
+
+| 服务 | 功能 | 端口 | 进程优先级 |
+|---|---|---|---|
+| `asr.service` | Whisper-base INT8 语音识别 | 8000 | 默认 |
+| `tts.service` | Piper lessac-low 语音合成 | 8001 | Nice=−15，实时调度 |
+| `rag.service` | ChromaDB + fastembed 向量检索 | 8002 | 默认 |
+| `ollama.service` | LLM 推理服务 | 11434 | 默认 |
+| `aitutor.service` | 主编排应用 | — | Nice=−20，实时调度，MEMLOCKED |
+
+> **设计说明：** `rag.service` 将 fastembed ONNX 运行在独立进程中，避免与 Ollama 共享堆内存，防止 LLM KV 缓存被驱逐——这是 RAG 首字时延从约 93 秒降至约 10.94 秒的核心原因。
 
 ---
 
@@ -353,8 +375,8 @@ for svc in systemd/*.service; do
     sudo cp /tmp/"$name" /etc/systemd/system/"$name"
 done
 sudo systemctl daemon-reload
-sudo systemctl enable ollama asr tts aitutor
-sudo systemctl start ollama asr tts aitutor
+sudo systemctl enable ollama asr tts rag aitutor
+sudo systemctl start ollama asr tts rag aitutor
 ```
 
 ---
@@ -365,7 +387,7 @@ sudo systemctl start ollama asr tts aitutor
 
 **对话模式** — 保留最多 6 轮历史，适合通用问答与闲聊。
 
-**RAG 学习模式** — 语义路由匹配成功后自动触发，每次查询独立检索，无历史积累（无状态设计）。
+**RAG 学习模式** — 语义路由匹配成功后，`main.py` 向 `rag.service`（:8002）发送 POST /retrieve 请求，获取最相关文档片段后构建增强提示词发送至 Ollama。每次查询独立检索，无历史积累（无状态设计）。
 
 | 手势 | 功能 |
 |---|---|
